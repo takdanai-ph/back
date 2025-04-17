@@ -259,8 +259,8 @@ app.use((err, req, res, next) => {
 });
 
 // --- Start Server ---
-// const PORT = process.env.PORT || 5001; // ใช้ Port จาก .env หรือ 5001 เป็นค่าสำรอง
-// server.listen(PORT, () => { // ใช้ server.listen (จาก http)
-//     console.log(`Server running on port ${PORT}`);
-//     // Scheduler จะเริ่มทำงานเองตามเวลาที่ตั้งไว้ ไม่ต้องเรียก .start() ซ้ำ
-// });
+const PORT = process.env.PORT || 5001; // ใช้ Port จาก .env หรือ 5001 เป็นค่าสำรอง
+server.listen(PORT, '0.0.0.0', () => { // ใช้ server.listen (จาก http)
+    console.log(`Server running on port ${PORT}`);
+    // Scheduler จะเริ่มทำงานเองตามเวลาที่ตั้งไว้ ไม่ต้องเรียก .start() ซ้ำ
+});
