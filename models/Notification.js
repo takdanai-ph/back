@@ -7,6 +7,7 @@ const NotificationSchema = new mongoose.Schema({
   notification_type: { type: String, required: true, 
     enum: [
         'task_assigned', 
+        'team_task_assigned',
         'task_updated', 
         'task_due_soon', 
         'task_overdue', 

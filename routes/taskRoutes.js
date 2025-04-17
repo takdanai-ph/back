@@ -268,39 +268,82 @@ router.get("/", protect, async (req, res) => {
 // --- POST /api/tasks (สร้าง Task) ---
 router.post("/", protect, authorize(['Admin', 'Manager']), async (req, res) => {
     const { title, description, dueDate, status, tags, assignee_id, team_id } = req.body;
+
+    console.log('[POST /api/tasks] Received request:', req.body);
+
      try {
-        if (!title || !description || !dueDate) { return res.status(400).json({ message: 'Title, description, and due date are required.' }); }
+        if (!title || !description || !dueDate) {
+             return res.status(400).json({ message: 'Title, description, and due date are required.' }); 
+            }
+
         if (assignee_id && !mongoose.Types.ObjectId.isValid(assignee_id)) return res.status(400).json({ message: 'Invalid Assignee ID format.' });
+
         if (team_id && !mongoose.Types.ObjectId.isValid(team_id)) return res.status(400).json({ message: 'Invalid Team ID format.' });
 
         const task = new Task({
-            title, description, dueDate, status, tags,
+            title, 
+            description, 
+            dueDate, 
+            status: status || 'Pending', 
+            tags,
             assignee_id: assignee_id || null,
             team_id: team_id || null,
-            // createdBy: req.user.id // พิจารณาเพิ่ม field นี้
         });
         await task.save();
+        console.log(`[POST /api/tasks] Task created successfully: ${task._id}, Assignee: ${task.assignee_id}, Team: ${task.team_id}`);
 
         // ส่วนแจ้งเตือน
         if (task.team_id && !task.assignee_id) {
+            console.log(`[POST /api/tasks] Attempting team notification for task ${task._id}, team ${task.team_id}`);
             try {
-                const team = await Team.findById(task.team_id).select('members').lean();
+                const team = await Team.findById(task.team_id)
+                                       .populate('members', '_id')
+                                       .lean();
+                console.log(`[POST /api/tasks] Team found for notification:`, team ? `ID: ${team._id}, Members Count: ${team.members?.length}`: 'Not Found');
+
                 if (team && team.members && team.members.length > 0) {
-                    const notificationPromises = team.members.map(memberId => {
-                        if (memberId) { return createNotification(memberId.toString(), task._id, 'team_task_assigned', `New team task assigned: ${task.title}`, `/task/${task._id}`); }
-                        return Promise.resolve();
+                    const notificationPromises = team.members.map(member => {
+                        if (member && member._id) { // <-- เช็คว่ามี member object และ _id
+                            console.log(`  - Queuing notification for member: ${member._id.toString()}`);
+                            return createNotification(
+                                member._id.toString(), // <-- ใช้ member._id
+                                task._id,
+                                'team_task_assigned',
+                                `New team task assigned: ${task.title}`,
+                                `/task/${task._id}`
+                            ).catch(err => console.error(`  - Failed notification for member ${member._id}:`, err)); // เพิ่ม Catch แยก
+                        }
+                        return Promise.resolve(); // Resolve ถ้า member data ไม่ถูกต้อง
                     });
                     await Promise.allSettled(notificationPromises);
+                    console.log(`[POST /api/tasks] Finished processing team notifications for task ${task._id}`);
+                } else {
+                    console.warn(`[POST /api/tasks] Team task ${task._id} created, but team ${task.team_id} not found or has no members. No team notifications sent.`);
                 }
-            } catch (notifyError) { console.error(`Error sending team notifications for task ${task._id}:`, notifyError); }
+            } catch (notifyError) { 
+                console.error(`[POST /api/tasks] Error during team notification process for task ${task._id}:`, notifyError); 
+            }
         } else if (task.assignee_id) {
-             createNotification( task.assignee_id.toString(), task._id, 'task_assigned', `You have been assigned a new task: ${task.title}`, `/task/${task._id}` )
-                 .catch(err => { console.error(`Failed to create notification for user ${task.assignee_id} for task ${task._id}:`, err); });
+            console.log(`[POST /api/tasks] Attempting individual notification for task ${task._id} to user ${task.assignee_id}`);
+             createNotification( 
+                task.assignee_id.toString(), 
+                task._id, 
+                'task_assigned', 
+                `You have been assigned a new task: ${task.title}`, 
+                `/task/${task._id}` 
+            )
+            .catch(err => { console.error(`[POST /api/tasks] Failed to create notification for user ${task.assignee_id} on task ${task._id}:`, err); });
+        } else {
+            console.log(`[POST /api/tasks] Task ${task._id} created with no assignee and no team.`);
         }
+
         res.status(201).json(task);
+
      } catch (error) {
-         console.error("Create Task Error:", error);
-         if (error.name === 'ValidationError') { return res.status(400).json({ message: error.message }); }
+         console.error("[POST /api/tasks] Create Task Error:", error);
+         if (error.name === 'ValidationError') { 
+            return res.status(400).json({ message: error.message }); 
+        }
          res.status(500).json({ message: error.message || "Error creating task." });
      }
 });

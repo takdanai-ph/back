@@ -108,7 +108,7 @@ router.post('/login', async (req, res) => {
 
 ////////////////////////////////////// ดู User (ทั้งหมด หรือ กรองตามเงื่อนไข) //////////////////////////////////////
 
-router.get('/users', protect, authorize(['Admin', 'Manager']), async (req, res) => { // <<< เปลี่ยน authorize ให้ Manager เข้าถึงได้ด้วย
+router.get('/users', protect, authorize(['Admin', 'Manager', 'User']), async (req, res) => { // <<< เปลี่ยน authorize ให้ Manager เข้าถึงได้ด้วย
   try {
     const { assignment } = req.query; // ดึงค่า query parameter 'assignment'
 
