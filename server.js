@@ -28,10 +28,10 @@ connectDB();
 
 // --- CORS ---
 // const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-const frontendUrl = process.env.FRONTEND_URL || 'https://taskmanagement-by-takdanai.vercel.app/';
+const frontendUrl = process.env.FRONTEND_URL || 'https://taskmanagement-by-takdanai.vercel.app';
 console.log(`Allowing CORS for origin: ${frontendUrl}`);
 app.use(cors({
-    origin: frontendUrl, // ใช้ URL จาก .env หรือค่า default
+    origin: frontendUrl,
     credentials: true
 }));
 
@@ -257,8 +257,8 @@ app.use((err, req, res, next) => {
 });
 
 // --- Start Server ---
-const PORT = process.env.PORT || 5001; // ใช้ Port จาก .env หรือ 5001 เป็นค่าสำรอง
-server.listen(PORT, () => { // ใช้ server.listen (จาก http)
-    console.log(`Server running on port ${PORT}`);
-    // Scheduler จะเริ่มทำงานเองตามเวลาที่ตั้งไว้ ไม่ต้องเรียก .start() ซ้ำ
-});
+// const PORT = process.env.PORT || 5001; // ใช้ Port จาก .env หรือ 5001 เป็นค่าสำรอง
+// server.listen(PORT, () => { // ใช้ server.listen (จาก http)
+//     console.log(`Server running on port ${PORT}`);
+//     // Scheduler จะเริ่มทำงานเองตามเวลาที่ตั้งไว้ ไม่ต้องเรียก .start() ซ้ำ
+// });
