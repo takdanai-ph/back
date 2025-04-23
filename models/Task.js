@@ -12,11 +12,15 @@ const taskSchema = new mongoose.Schema(
     completedAt: { type: Date, required: false },
     dueDateReminderSent: { type: Boolean, default: false },
     overdueReminderSent: { type: Boolean, default: false },
+    needsCompletionApproval: { type: Boolean, default: false, index: true,},
   },
   { timestamps: true }
 );
 
-taskSchema.index({ status: 1, dueDate: 1, dueDateReminderSent: 1, overdueReminderSent: 1 });
+// taskSchema.index({ status: 1, dueDate: 1, dueDateReminderSent: 1, overdueReminderSent: 1 });
+taskSchema.index({ status: 1, needsCompletionApproval: 1, dueDate: 1 });
+taskSchema.index({ assignee_id: 1, status: 1, needsCompletionApproval: 1 });
+taskSchema.index({ team_id: 1, status: 1, needsCompletionApproval: 1 });
 
 const Task = mongoose.model("Task", taskSchema);
 

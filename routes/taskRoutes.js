@@ -5,7 +5,7 @@ const Task = require("../models/Task");
 const User = require('../models/User');
 const Team = require('../models/Team');
 const { protect, authorize } = require('../middleware/authMiddleware');
-const { createNotification } = require('../utils/notificationHelper');
+const { createNotification, findRelevantAdminOrManager } = require('../utils/notificationHelper');
 const sendEmail = require('../utils/sendEmail');
 
 const router = express.Router();
@@ -406,7 +406,7 @@ router.get("/:id", protect, async (req, res) => {
 });
 
 // --- PUT /api/tasks/:id (แก้ไข Task - ใช้ Logic ที่รวมแล้วอันเดียว) ---
-router.put("/:id", protect, async (req, res) => {
+router.put("/:id", protect, async (req, res) => { // ลบ authorize ออกก่อน เพราะ User ต้องเข้าได้ แต่จำกัดสิทธิ์ข้างใน
     try {
         const taskId = req.params.id;
         const userRole = req.user.role;
@@ -414,165 +414,228 @@ router.put("/:id", protect, async (req, res) => {
 
         if (!mongoose.Types.ObjectId.isValid(taskId)) return res.status(400).json({ message: "Invalid Task ID format." });
 
-        // --- ดึงข้อมูล Task เดิมก่อน เพื่อเปรียบเทียบ Assignee/Team ---
-        const existingTask = await Task.findById(taskId).select('assignee_id team_id status'); // ดึง team_id เดิมมาด้วย
+        // --- ดึงข้อมูล Task เดิมก่อน เพื่อเปรียบเทียบ และเช็คสิทธิ์ ---
+        // ดึง needsCompletionApproval มาด้วย
+        const existingTask = await Task.findById(taskId).select('title assignee_id team_id status completedAt needsCompletionApproval');
         if (!existingTask) return res.status(404).json({ message: "Task not found" });
 
         const oldAssigneeId = existingTask.assignee_id ? existingTask.assignee_id.toString() : null;
-        const oldTeamId = existingTask.team_id ? existingTask.team_id.toString() : null; // <-- เก็บ ID ทีมเดิม
+        const oldTeamId = existingTask.team_id ? existingTask.team_id.toString() : null;
 
         let updateData = {};
         let allowedToUpdate = false;
-        let newAssigneeIdFromBody = null;
-        let newTeamIdFromBody = null; // <-- เก็บ ID ทีมใหม่จาก Body
+        let requiresApprovalCheck = false; // Flag ว่าต้องเช็คการ Approve/Reject หรือไม่
 
         // --- Logic กำหนด updateData และ allowedToUpdate ตาม Role ---
         if (userRole === 'Admin' || userRole === 'Manager') {
             allowedToUpdate = true;
-            const { title, description, dueDate, status, tags, assignee_id, team_id } = req.body; // รับ team_id มาด้วย
+            requiresApprovalCheck = true; // Admin/Manager อาจต้อง Approve/Reject
+            const { title, description, dueDate, status, tags, assignee_id, team_id } = req.body;
 
             // ... Validation (เหมือนเดิม) ...
              if (status && !['Pending', 'In Progress', 'Completed'].includes(status)) return res.status(400).json({ message: "Invalid status value." });
              if (assignee_id && assignee_id !== '' && !mongoose.Types.ObjectId.isValid(assignee_id)) return res.status(400).json({ message: 'Invalid Assignee ID format.' });
              if (team_id && team_id !== '' && !mongoose.Types.ObjectId.isValid(team_id)) return res.status(400).json({ message: 'Invalid Team ID format.' });
 
-            // สร้าง updateData (เหมือนเดิม แต่เพิ่มการจัดการ team_id)
+            // สร้าง updateData (เหมือนเดิม แต่จะปรับ status และ needsCompletionApproval ทีหลัง)
             if (title !== undefined) updateData.title = title;
             if (description !== undefined) updateData.description = description;
             if (dueDate !== undefined) updateData.dueDate = dueDate;
-            if (status !== undefined) updateData.status = status;
+            if (status !== undefined) updateData.status = status; // เก็บ status ที่ส่งมาก่อน
             if (tags !== undefined) updateData.tags = tags;
-            // จัดการ Assignee และ Team (ถ้าส่งอันใดอันหนึ่งมา อีกอันควรเป็น null)
-            if (assignee_id !== undefined) {
-                updateData.assignee_id = assignee_id || null;
-                newAssigneeIdFromBody = updateData.assignee_id ? updateData.assignee_id.toString() : null;
-                if(updateData.assignee_id) updateData.team_id = null; // ถ้ามี Assignee ให้ Team เป็น null
-            }
-            if (team_id !== undefined) {
-                updateData.team_id = team_id || null;
-                newTeamIdFromBody = updateData.team_id ? updateData.team_id.toString() : null;
-                if(updateData.team_id) updateData.assignee_id = null; // ถ้ามี Team ให้ Assignee เป็น null
-            }
-            // ถ้าไม่ได้ส่ง assignee_id หรือ team_id มา ให้ใช้ค่าเดิมจาก new...FromBody ที่กำหนดไว้ข้างบน
-            if (newAssigneeIdFromBody === null && assignee_id === undefined) newAssigneeIdFromBody = oldAssigneeId;
-            if (newTeamIdFromBody === null && team_id === undefined) newTeamIdFromBody = oldTeamId;
+            if (assignee_id !== undefined) updateData.assignee_id = assignee_id || null;
+            if (team_id !== undefined) updateData.team_id = team_id || null;
+            // จัดการ team/assignee conflict (เหมือนเดิม)
+            if (updateData.assignee_id) updateData.team_id = null;
+            else if (updateData.team_id) updateData.assignee_id = null;
 
+            // *** Logic ใหม่: จัดการ needsCompletionApproval และ completedAt สำหรับ Admin/Manager ***
+            const newStatus = updateData.status !== undefined ? updateData.status : existingTask.status;
 
-            // completedAt logic (เหมือนเดิม)
-            const currentStatus = updateData.status !== undefined ? updateData.status : existingTask.status;
-            if (currentStatus === "Completed" && existingTask.status !== "Completed") updateData.completedAt = new Date();
-            else if (currentStatus !== "Completed" && existingTask.status === "Completed") updateData.completedAt = null;
+            if (newStatus === 'Completed') {
+                updateData.needsCompletionApproval = false; // Admin/Manager ตั้ง -> ไม่ต้องรอ Approve
+                
+                updateData.completedAt = new Date();
+
+                // *** (Optional) ถ้าเป็นการ Approve งานที่ User ส่งมา -> แจ้ง User ***
+                if (existingTask.needsCompletionApproval && updateData.status !== undefined) { // เช็คว่าก่อนหน้านี้รอ Approve และมีการส่ง status มา
+                    // ใช้ createNotification จาก ../utils/notificationHelper
+                    if (existingTask.assignee_id) {
+                        createNotification(
+                            existingTask.assignee_id.toString(),
+                            taskId,
+                            'task_approved', // Event type ใหม่
+                            `Your task "${updateData.title || existingTask.title}" has been approved by ${req.user.fname}.`, // ใช้ req.user.fname จาก token
+                            `/task/${taskId}`
+                        ).catch(err => console.error(`[Approval Notify] Failed approve notify for ${existingTask.assignee_id}:`, err));
+                    }
+                }
+            } else { // ถ้า Status ใหม่ ไม่ใช่ Completed
+                // ถ้างานเดิมรอ Approve อยู่ แล้ว Admin/Manager เปลี่ยนเป็นสถานะอื่น (Reject)
+                if (existingTask.needsCompletionApproval && updateData.status !== undefined) {
+                     updateData.needsCompletionApproval = false;
+                     updateData.completedAt = null;
+                     // *** (Optional) แจ้ง User ว่างานถูก Reject ***
+                     if (existingTask.assignee_id) {
+                        createNotification(
+                            existingTask.assignee_id.toString(),
+                            taskId,
+                            'task_rejected', // Event type ใหม่
+                            `Task "${updateData.title || existingTask.title}" needs revision (Status set to ${newStatus} by ${req.user.fname}).`,
+                            `/task/${taskId}`
+                         ).catch(err => console.error(`[Approval Notify] Failed reject notify for ${existingTask.assignee_id}:`, err));
+                     }
+                } else if (existingTask.status === 'Completed' && newStatus !== 'Completed') {
+                    // ถ้าเปลี่ยนจาก Completed (ที่ Approve แล้ว) กลับเป็นสถานะอื่น
+                    updateData.completedAt = null; // เอาเวลาเสร็จออก
+                    updateData.needsCompletionApproval = false; // ก็ไม่ต้องรอ Approve
+                }
+            }
 
         } else if (userRole === 'User') {
-             // ... User logic (แก้ status เท่านั้น - เหมือนเดิม) ...
-              if (existingTask.assignee_id && existingTask.assignee_id.equals(userId)) {
-                const { status } = req.body;
-                if (Object.keys(req.body).length === 1 && req.body.hasOwnProperty('status')) {
-                     if (status && ['Pending', 'In Progress', 'Completed'].includes(status)) {
-                          if (status !== existingTask.status) {
-                               allowedToUpdate = true;
-                               updateData.status = status;
-                               if (status === "Completed") updateData.completedAt = new Date();
-                               else if (existingTask.status === "Completed") updateData.completedAt = null;
-                          }
-                     } else { return res.status(400).json({ message: "Invalid status value." }); }
-                } else if (Object.keys(req.body).length > 0) { return res.status(403).json({ message: "Forbidden: Users can only update task status." }); }
-            } else { return res.status(403).json({ message: "Forbidden: You can only update tasks assigned to you." }); }
-            // User ไม่ได้เปลี่ยน Assignee/Team
-            newAssigneeIdFromBody = oldAssigneeId;
-            newTeamIdFromBody = oldTeamId;
-        } else { return res.status(403).json({ message: "Forbidden: Insufficient permissions." }); }
+            // --- ปรับปรุง Logic การตรวจสอบสิทธิ์สำหรับ User ---
+            const isDirectAssignee = existingTask.assignee_id && existingTask.assignee_id.equals(userId);
+            // ดึง team_id ของ User ที่กำลัง request มาจาก req.user (ที่ได้จาก Middleware)
+            const userTeamId = req.user.team_id ? req.user.team_id.toString() : null;
+            // ตรวจสอบว่าเป็น Task ของทีมที่ User อยู่ และไม่ได้ Assign ให้คนอื่น
+            const isTeamMemberUpdatingTeamTask = existingTask.team_id &&
+                                                 userTeamId &&
+                                                 existingTask.team_id.toString() === userTeamId &&
+                                                 !existingTask.assignee_id; // เช็คว่า assignee_id ต้องไม่มีค่า
 
+            // อนุญาตให้อัปเดตถ้าเป็น Assignee โดยตรง หรือ เป็นสมาชิกทีมที่กำลังอัปเดตงานของทีม (ที่ไม่ได้ Assign ให้คนอื่น)
+            if (!isDirectAssignee && !isTeamMemberUpdatingTeamTask) {
+                 return res.status(403).json({ message: "Forbidden: You can only update tasks assigned directly to you or unassigned tasks belonging to your team." });
+            }
+            // -----------------------------------------------------
+
+            // User สามารถอัปเดตได้แค่ status (โค้ดส่วนนี้เหมือนเดิม)
+            const { status } = req.body;
+            if (Object.keys(req.body).length === 1 && req.body.hasOwnProperty('status')) {
+                if (status && ['Pending', 'In Progress', 'Completed'].includes(status)) {
+                    if (status !== existingTask.status || (status === 'Completed' && existingTask.needsCompletionApproval)) {
+                        allowedToUpdate = true;
+                        if (status === 'Completed') {
+                            // --- โค้ดเดิมของคุณ ไม่ต้องแก้ ---
+                            updateData.status = 'Completed';
+                            updateData.needsCompletionApproval = true;
+                            updateData.completedAt = null;
+                            // ----------------------------------
+    
+                            // (Optional) Notify Admin/Manager
+                            const relevantAdminOrManagerIds = await findRelevantAdminOrManager(existingTask);
+    
+                            // +++ เพิ่ม Log ตรงนี้ +++
+                            console.log('[DEBUG] relevantAdminOrManagerIds:', relevantAdminOrManagerIds);
+                            // +--------------------+
+    
+                            if (relevantAdminOrManagerIds && relevantAdminOrManagerIds.length > 0) {
+                                 // +++ เพิ่ม Log ตรงนี้ +++
+                                 console.log('[DEBUG] Entering map to create notifications for admins:', relevantAdminOrManagerIds);
+                                 // +--------------------+
+    
+                                const notificationPromises = relevantAdminOrManagerIds.map(adminId => {
+                                     // +++ เพิ่ม Log ตรงนี้ +++
+                                     console.log(`[DEBUG] Mapping adminId: ${adminId} (Type: ${typeof adminId})`);
+                                     // +--------------------+
+                                    return createNotification( // <<< ต้องมี return ตรงนี้ด้วยนะครับ
+                                        adminId,
+                                        taskId,
+                                        'task_pending_approval',
+                                        `Task "${existingTask.title}" submitted by ${req.user.fname} requires approval.`,
+                                        `/task/${taskId}`
+                                    ).catch(err => console.error(`[Approval Notify] Failed pending notify for admin ${adminId}:`, err));
+                                 });
+                                Promise.allSettled(notificationPromises);
+                            } else {
+                                 // +++ เพิ่ม Log ตรงนี้ (Optional) +++
+                                 console.log('[Notify Check] No relevant admins/managers found or returned array was empty/null.');
+                                 // +--------------------------------+
+                            }
+                        } else { // <<< ส่วน else นี้ไม่ต้องยุ่ง
+                            updateData.status = status;
+                            updateData.needsCompletionApproval = false;
+                            updateData.completedAt = null;
+                        }
+                    } else {
+                        allowedToUpdate = false;
+                    }
+                } else { return res.status(400).json({ message: "Invalid status value." }); }
+            } else if (Object.keys(req.body).length > 0) { return res.status(403).json({ message: "Forbidden: Users can only update task status." }); }
+        }
         // --- ทำการ Update ถ้าได้รับอนุญาตและมีข้อมูลที่จะ Update จริงๆ ---
         if (allowedToUpdate && Object.keys(updateData).length > 0) {
             console.log(`[PUT /api/tasks/:id] Updating Task ${taskId} with data:`, updateData);
             const updatedTaskResult = await Task.findByIdAndUpdate(taskId, updateData, { new: true, runValidators: true })
-                                        .populate('assignee_id', '_id email fname') // Populate field ที่ต้องการ
-                                        .populate('team_id', '_id name'); // Populate team ด้วย
+                                        .populate('assignee_id', '_id email fname username') // Populate ให้ครบถ้วน
+                                        .populate('team_id', '_id name');
 
-             // ตรวจสอบ Assignee/Team ID *หลัง* การ Update
-            const currentNewAssigneeId = updatedTaskResult.assignee_id?._id?.toString(); // ID ของ Assignee ใหม่ (อาจเป็น null)
-            const currentNewTeamId = updatedTaskResult.team_id?._id?.toString();       // ID ของ Team ใหม่ (อาจเป็น null)
+            // ส่วน Logic การแจ้งเตือนการเปลี่ยน Assignee/Team (เหมือนเดิม)
+            const currentNewAssigneeId = updatedTaskResult.assignee_id?._id?.toString();
+            const currentNewTeamId = updatedTaskResult.team_id?._id?.toString();
+            const newAssigneeIdFromBody = updateData.assignee_id !== undefined ? (updateData.assignee_id ? updateData.assignee_id.toString() : null) : oldAssigneeId; // ต้องคำนวณใหม่ให้แม่นยำ
+            const newTeamIdFromBody = updateData.team_id !== undefined ? (updateData.team_id ? updateData.team_id.toString() : null) : oldTeamId; // ต้องคำนวณใหม่ให้แม่นยำ
 
             const frontendUrl = process.env.FRONTEND_URL
             const taskLink = `${frontendUrl}/task/${updatedTaskResult._id}`;
 
-            // *** ตรรกะการแจ้งเตือนที่ปรับปรุงแล้ว ***
-
-            // กรณีที่ 1: มีการเปลี่ยนไปให้ Assignee คนใหม่ (และไม่ใช่ทีม)
             if (newAssigneeIdFromBody && newAssigneeIdFromBody !== oldAssigneeId) {
-                console.log(`[PUT /api/tasks/:id] Assignee changed. Notifying new individual assignee: ${newAssigneeIdFromBody}`);
-                const notificationMessage = `Task assigned to you: ${updatedTaskResult.title}`;
-                const emailSubject = `Task Assigned to You: ${updatedTaskResult.title}`;
+                 // ... (Code การแจ้งเตือน Assignee ใหม่ เหมือนเดิม) ...
+                 console.log(`[PUT /api/tasks/:id] Assignee changed. Notifying new individual assignee: ${newAssigneeIdFromBody}`);
+                 const notificationMessage = `Task assigned to you: ${updatedTaskResult.title}`;
+                 const emailSubject = `Task Assigned to You: ${updatedTaskResult.title}`;
+                 createNotification(newAssigneeIdFromBody, updatedTaskResult._id, 'task_assigned', notificationMessage, taskLink)
+                     .catch(err => { console.error(`[PUT /api/tasks/:id] Failed notification for assignment update to user ${newAssigneeIdFromBody}:`, err); });
+                 User.findById(newAssigneeIdFromBody).select('email fname').lean().then(newUser => {
+                      if (newUser && newUser.email) {
+                         const emailMessage = `Hi ${newUser.fname || 'User'},\n\nYou have been assigned the task: "${updatedTaskResult.title}".\n\nDue Date: ${updatedTaskResult.dueDate.toLocaleDateString('th-TH')}\n\nView Task: ${taskLink}`;
+                         sendEmail({ email: newUser.email, subject: emailSubject, message: emailMessage })
+                              .catch(err => console.error(`  - Failed sending reassignment email to ${newUser.email}:`, err));
+                      }
+                  }).catch(err => console.error(`[PUT /api/tasks/:id] Error fetching user ${newAssigneeIdFromBody} for email:`, err));
 
-                // สร้าง Notification
-                createNotification(newAssigneeIdFromBody, updatedTaskResult._id, 'task_assigned', notificationMessage, `/task/${updatedTaskResult._id}`)
-                    .catch(err => { console.error(`[PUT /api/tasks/:id] Failed notification for assignment update to user ${newAssigneeIdFromBody}:`, err); });
-
-                // ดึงข้อมูล User ใหม่ แล้วส่ง Email
-                User.findById(newAssigneeIdFromBody).select('email fname').lean().then(newUser => {
-                     if (newUser && newUser.email) {
-                        console.log(`  - Sending reassignment email to ${newUser.email}`);
-                        const emailMessage = `Hi ${newUser.fname || 'User'},\n\nYou have been assigned the task: "${updatedTaskResult.title}".\n\nDue Date: ${updatedTaskResult.dueDate.toLocaleDateString('th-TH')}\n\nView Task: ${taskLink}`;
-                        sendEmail({ email: newUser.email, subject: emailSubject, message: emailMessage })
-                             .catch(err => console.error(`  - Failed sending reassignment email to ${newUser.email}:`, err));
-                     } else { console.warn(`[PUT /api/tasks/:id] New assignee ${newAssigneeIdFromBody} has no email. Email not sent.`); }
-                 }).catch(err => console.error(`[PUT /api/tasks/:id] Error fetching user ${newAssigneeIdFromBody} for email:`, err));
+            } else if (newTeamIdFromBody && newTeamIdFromBody !== oldTeamId && !currentNewAssigneeId) {
+                 // ... (Code การแจ้งเตือน Team ใหม่ เหมือนเดิม) ...
+                  console.log(`[PUT /api/tasks/:id] Assignment changed. Notifying new team: ${newTeamIdFromBody}`);
+                  try {
+                     const team = await Team.findById(newTeamIdFromBody).populate('members', '_id email fname').lean();
+                     if (team && team.members && team.members.length > 0) {
+                         const notificationPromises = []; const emailPromises = [];
+                         const notificationMessage = `New team task assigned: ${updatedTaskResult.title}`;
+                         const emailSubject = `New Team Task Assigned: ${updatedTaskResult.title}`;
+                         team.members.forEach(member => {
+                             if (member && member._id) {
+                                 notificationPromises.push(createNotification(member._id.toString(), updatedTaskResult._id, 'team_task_assigned', notificationMessage, taskLink).catch(err => console.error(`  - Failed team notification for member ${member._id}:`, err)));
+                                 if (member.email) {
+                                     const emailMessage = `Hi ${member.fname || 'Team Member'},\n\nA new task "${updatedTaskResult.title}" has been assigned to your team.\n\nDue Date: ${updatedTaskResult.dueDate.toLocaleDateString('th-TH')}\n\nView Task: ${taskLink}`;
+                                     emailPromises.push(sendEmail({ email: member.email, subject: emailSubject, message: emailMessage }).catch(err => console.error(`  - Failed sending team email to ${member.email}:`, err)));
+                                 }
+                             }
+                         });
+                         Promise.allSettled([...notificationPromises, ...emailPromises]);
+                     }
+                  } catch (teamNotifyError) { console.error(`[PUT /api/tasks/:id] Error during new team notification process for task ${updatedTaskResult._id}:`, teamNotifyError); }
             }
-            // กรณีที่ 2: มีการเปลี่ยนไปให้ Team ใหม่ (และไม่มี Assignee)
-            else if (newTeamIdFromBody && newTeamIdFromBody !== oldTeamId && !currentNewAssigneeId) {
-                 console.log(`[PUT /api/tasks/:id] Assignment changed. Notifying new team: ${newTeamIdFromBody}`);
-                 try {
-                    const team = await Team.findById(newTeamIdFromBody)
-                                       .populate('members', '_id email fname') // Populate fields ที่ต้องการ
-                                       .lean();
-                    console.log(`[PUT /api/tasks/:id] New team found:`, team ? `ID: ${team._id}, Members Count: ${team.members?.length}`: 'Not Found');
-
-                    if (team && team.members && team.members.length > 0) {
-                        const notificationPromises = [];
-                        const emailPromises = [];
-                        const notificationMessage = `New team task assigned: ${updatedTaskResult.title}`;
-                        const emailSubject = `New Team Task Assigned: ${updatedTaskResult.title}`;
-
-                        team.members.forEach(member => {
-                            if (member && member._id) {
-                                console.log(`  - Queuing team notification/email for member: ${member._id.toString()} (${member.email || 'No Email'})`);
-                                notificationPromises.push(
-                                    createNotification(member._id.toString(), updatedTaskResult._id, 'team_task_assigned', notificationMessage, `/task/${updatedTaskResult._id}`)
-                                        .catch(err => console.error(`  - Failed team notification for member ${member._id}:`, err))
-                                );
-                                if (member.email) {
-                                    const emailMessage = `Hi ${member.fname || 'Team Member'},\n\nA new task "${updatedTaskResult.title}" has been assigned to your team.\n\nDue Date: ${updatedTaskResult.dueDate.toLocaleDateString('th-TH')}\n\nView Task: ${taskLink}`;
-                                    emailPromises.push(
-                                        sendEmail({ email: member.email, subject: emailSubject, message: emailMessage })
-                                            .catch(err => console.error(`  - Failed sending team email to ${member.email}:`, err))
-                                    );
-                                }
-                            }
-                        });
-                        Promise.allSettled([...notificationPromises, ...emailPromises]);
-                        console.log(`[PUT /api/tasks/:id] Finished processing new team notifications/emails for task ${updatedTaskResult._id}`);
-                    } else { console.warn(`[PUT /api/tasks/:id] Task ${updatedTaskResult._id} assigned to team ${newTeamIdFromBody}, but team not found or has no members.`); }
-                 } catch (teamNotifyError) { console.error(`[PUT /api/tasks/:id] Error during new team notification process for task ${updatedTaskResult._id}:`, teamNotifyError); }
-            }
-            // กรณีอื่นๆ: ไม่มีการเปลี่ยน Assignee หรือ Team ที่ต้องแจ้งเตือน
-
-            // ... (ส่วน Notification Task Completed ถ้าต้องการ) ...
 
             res.json(updatedTaskResult);
 
-        } else {
-            // ... (ส่งข้อมูลเดิมกลับไป ถ้าไม่มีการ Update) ...
-             console.log(`[PUT /api/tasks/:id] No update applied for Task ${taskId}. Returning existing task.`);
-             const taskToSend = await Task.findById(taskId).populate('assignee_id', '_id email fname').populate('team_id', '_id name');
+        } else if (!allowedToUpdate && Object.keys(updateData).length === 0) {
+            // ถ้าไม่มีการเปลี่ยนแปลงข้อมูลเลย หรือกดสถานะเดิม (ที่ไม่ใช่ Completed รอ Approve)
+             console.log(`[PUT /api/tasks/:id] No effective update applied for Task ${taskId}. Returning existing task.`);
+             // Populate ให้เหมือนตอน success เพื่อให้ response structure เหมือนกัน
+             const taskToSend = await Task.findById(taskId)
+                                       .populate('assignee_id', '_id email fname username')
+                                       .populate('team_id', '_id name');
              res.json(taskToSend);
+        } else {
+            // กรณีอื่นๆ ที่ไม่ควรเกิดขึ้น แต่ใส่ไว้เผื่อ
+            res.status(400).json({ message: "Update condition not met or no data provided." });
         }
 
     } catch (error) {
         // ... (Error Handling เหมือนเดิม) ...
          console.error("[PUT /api/tasks/:id] Update Task Error:", error);
-         if (error.name === 'CastError' && error.path === 'assignee_id') return res.status(400).json({ message: `Invalid Assignee ID format in request body: ${error.value}`});
-         if (error.name === 'CastError') return res.status(400).json({ message: `Invalid ID format: ${error.path}` });
+         if (error.name === 'CastError') return res.status(400).json({ message: `Invalid ID format in request: ${error.path}=${error.value}` });
          if (error.name === 'ValidationError') return res.status(400).json({ message: error.message });
          res.status(500).json({ message: error.message || "An error occurred while updating the task." });
     }

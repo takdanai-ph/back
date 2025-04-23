@@ -70,7 +70,7 @@ router.post('/login', async (req, res) => {
     
     // สร้าง Token ตั้งเวลาให้หมดอายุ
     const token = jwt.sign(
-      { id: user._id, username: user.username, role: user.role, team_id: user.team_id },
+      { id: user._id, username: user.username, role: user.role, team_id: user.team_id, fname: user.fname },
       process.env.JWT_SECRET,
       { expiresIn: '1d' }
     );

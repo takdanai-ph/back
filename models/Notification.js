@@ -12,6 +12,9 @@ const NotificationSchema = new mongoose.Schema({
         'task_due_soon', 
         'task_overdue', 
         'comment_added', 
+        'task_pending_approval', // User ส่งงานรอ Approve
+        'task_approved',         // Admin/Manager กด Approve
+        'task_rejected',
         'other'
     ],
 
